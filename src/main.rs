@@ -1,34 +1,40 @@
-extern crate bincode;
 extern crate cargo;
 extern crate daggy;
+#[macro_use]
 extern crate failure;
+extern crate fallible_iterator;
+extern crate semver;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+extern crate serde_json;
 extern crate walkdir;
 
-use bincode::{serialize_into, Infinite};
-use cargo::core::{Dependency, PackageId, Source, SourceId, Summary};
+use cargo::core::SourceId;
 use cargo::util::config::Config;
+use cargo::util::hex;
 use daggy::Dag;
-use failure::{Error, SyncFailure};
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use failure::{Error, ResultExt, SyncFailure};
+use fallible_iterator::FallibleIterator;
+use semver::{Version, VersionReq};
+use std::boxed::Box;
+use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader};
+use std::path::{Path};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
-trait ResultExt<T, E> {
+trait ResultExt2<T, E> {
     fn sync(self) -> Result<T, SyncFailure<E>>
     where
         Self: Sized,
         E: ::std::error::Error + Send + 'static;
 }
 
-impl<T, E> ResultExt<T, E> for Result<T, E> {
+impl<T, E> ResultExt2<T, E> for Result<T, E> {
     fn sync(self) -> Result<T, SyncFailure<E>>
     where
         Self: Sized,
@@ -38,124 +44,88 @@ impl<T, E> ResultExt<T, E> for Result<T, E> {
     }
 }
 
-fn list_registry_crates<P: AsRef<Path>>(regpath: P) -> Vec<String> {
-    WalkDir::new(&regpath)
-        .into_iter()
-        .filter_map(|e| e.ok()
-                    .and_then(|f| {
-                        if f.file_type().is_file() && f.depth() > 1 {
-                            Some(f.file_name().to_owned().to_string_lossy().into_owned())
-                        } else {
-                            None
-                        }
-                    }))
-        .collect()
-}
-/*
-fn filter_dependencies<'s, F>(mut source: &'s mut Source, crates: Vec<String>, filter: F) -> Box<Iterator<Item=Dependency> + 's>
-    where F: Fn(&Dependency) -> bool,
-          F: 's,
+fn read_crate_json<P>(path: P) -> Result<Crate, Error>
+    where P: AsRef<Path>,
 {
-    Box::new(crates.into_iter()
-             .filter_map(move |name| {
-                 let krate = Dependency::parse_no_deprecated(&name,
-                                                             None,
-                                                             source.source_id()).unwrap();
-                 source.query_vec(&krate).ok().map(|versions| (krate, versions))
-             })
-             .filter(move |&(_, ref versions)| {
-                 versions.iter().any(|v: &Summary| v.dependencies().iter().any(&filter))
-             })
-             .map(|(krate, _)| krate)
-    )
+    let path = path.as_ref();
+    let f = BufReader::new(File::open(path)?);
+    let mut versions: Vec<_> =
+        fallible_iterator::convert::<CrateVersion, Error, _>(
+            f.lines().map(|l| {
+                let l = l?;
+                Ok(serde_json::from_reader(l.as_bytes()).with_context(|e| {
+                    format!("Error reading line from {:?}: {}, `{}`",
+                            path, e, l)
+                })?)
+            })).collect()?;
+    versions.reverse();
+    let name = versions.first().unwrap().name.clone();
+    Ok(Crate {
+        name,
+        versions,
+    })
 }
- */
 
+fn list_registry_crates<P: AsRef<Path>>(regpath: P) -> Box<FallibleIterator<Item=Crate, Error=Error>> {
+    Box::new(fallible_iterator::convert(
+        WalkDir::new(&regpath)
+            .into_iter()
+            .filter_entry(|e| e.file_name() != ".git")
+            .filter_map(|e| e.ok().and_then(|f| {
+                if f.file_type().is_file() && f.depth() > 1 {
+                    Some(read_crate_json(f.path()))
+                } else {
+                    None
+                }
+            }))))
+}
 
-#[derive(PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Dependency {
+    name: String,
+    req: VersionReq,
+    features: Vec<String>,
+    optional: bool,
+    default_features: bool,
+    target: Option<String>,
+    kind: Option<String>,
+}
+
+impl fmt::Display for Dependency {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} {}", self.name, self.req)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Crate {
-    #[serde(with = "SummaryDef")]
-    summary: Summary,
+    name: String,
+    versions: Vec<CrateVersion>,
 }
 
-impl Crate {
-    fn new(summary: Summary) -> Crate {
-        Crate { summary }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CrateVersion {
+    name: String,
+    #[serde(rename = "vers")]
+    version: Version,
+    deps: Vec<Dependency>,
+    cksum: String,
+    features: HashMap<String, Vec<String>>,
+    yanked: bool,
+}
+
+impl fmt::Display for CrateVersion {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} {}", self.name, self.version)
     }
 }
 
-fn summary_dependencies(summary: &Summary) -> Vec<DependencyDef> {
-    summary.dependencies().iter().map(|d| d.clone().into()).collect()
-}
-
-#[derive(Serialize)]
-#[serde(remote = "Summary")]
-struct SummaryDef {
-    #[serde(getter = "Summary::package_id")]
-    pkg_id: PackageId,
-    #[serde(getter = "summary_dependencies")]
-    dependencies: Vec<DependencyDef>,
-    #[serde(getter = "Summary::features")]
-    features: BTreeMap<String, Vec<String>>,
-}
-
-impl From<SummaryDef> for Summary {
-    fn from(s: SummaryDef) -> Summary {
-        let SummaryDef { pkg_id, dependencies, features } = s;
-        let dependencies = dependencies.into_iter().map(|d| d.into()).collect();
-        Summary::new(pkg_id, dependencies, features).unwrap()
-    }
-}
-
-#[derive(Serialize)]
-struct DependencyDef {
-    dependency: Dependency,
-}
-
-impl From<Dependency> for DependencyDef {
-    fn from(dependency: Dependency) -> DependencyDef {
-        DependencyDef { dependency }
-    }
-}
-
-impl Into<Dependency> for DependencyDef {
-    fn into(self) -> Dependency {
-        self.dependency
-    }
-}
-
-impl Eq for Crate {}
-
-impl Ord for Crate {
-    fn cmp(&self, other: &Crate) -> Ordering {
-        self.summary.package_id().cmp(&other.summary.package_id())
-    }
-}
-
-impl PartialOrd for Crate {
-    fn partial_cmp(&self, other: &Crate) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl From<Summary> for Crate {
-    fn from(s: Summary) -> Crate {
-        Crate::new(s)
-    }
-}
-
-/*
-impl Hash for Crate {
+impl Hash for CrateVersion {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-        self.phone.hash(state);
+        self.name.hash(state);
+        self.version.hash(state);
     }
 }
- */
-
-//type CrateKey = (String, Version);
-//type CrateMap = HashMap<CrateKey, Summary>;
-type CrateSet = BTreeSet<Crate>;
 
 /// Format `duration` as seconds with a fractional component.
 fn fmt_duration_as_secs(duration: &Duration) -> String
@@ -163,72 +133,82 @@ fn fmt_duration_as_secs(duration: &Duration) -> String
     format!("{}.{:03} s", duration.as_secs(), duration.subsec_nanos() / 1000_000)
 }
 
-fn find_crates<P>(regpath: P, source: &mut Source) -> Result<CrateSet, Error>
+fn find_crates<P>(regpath: P) -> Result<Vec<Crate>, Error>
     where P: AsRef<Path>,
+
 {
     // List crates by recursively walking the index.
     let start = Instant::now();
-    let crate_names = list_registry_crates(regpath);
-    println!("Found {} crates in {}", crate_names.len(), fmt_duration_as_secs(&start.elapsed()));
-    // First, ask the registry to load all crates, and build a HashMap of
-    // (name, version) -> Summary
-    let start = Instant::now();
-    let crates: CrateSet = crate_names.into_iter().filter_map(move |name| {
-        let krate = Dependency::parse_no_deprecated(&name,
-                                                    None,
-                                                    source.source_id()).unwrap();
-        source.query_vec(&krate).ok()
-    }).flat_map(|summaries| summaries.into_iter().map(|s| s.into())).collect();
-    println!("Loaded {} crate versions in {}", crates.len(),
-             fmt_duration_as_secs(&start.elapsed()));
+    let crates: Vec<_> = list_registry_crates(regpath).collect()?;
+    println!("Found {} crates in {}", crates.len(), fmt_duration_as_secs(&start.elapsed()));
     Ok(crates)
 }
 
-fn load_cached_crate_list<P>(path: P) -> Result<CrateSet, Error>
-    where P: AsRef<Path>,
-{
-    unimplemented!()
-}
-
-fn save_crate_list<P>(crates: &CrateSet, path: P) -> Result<(), Error>
-    where P: AsRef<Path>,
-{
-    let start = Instant::now();
-    let mut f = File::create(path)?;
-    serialize_into(&mut f, crates, Infinite)?;
-    println!("Saved index cache in {}", fmt_duration_as_secs(&start.elapsed()));
-    Ok(())
-}
-
-fn get_crate_list(config: &Config, source: &mut Source) -> Result<CrateSet, Error> {
-    let regpath = config.registry_index_path().into_path_unlocked();
-    let mut cache_filename = OsString::from(regpath.file_name().unwrap());
-    cache_filename.push(".cache");
-    let cache_filename = PathBuf::from(cache_filename);
-    if cache_filename.exists() {
-        load_cached_crate_list(&cache_filename)
-    } else {
-        let crates = find_crates(regpath, source)?;
-        save_crate_list(&crates, &cache_filename)?;
-        Ok(crates)
-    }
+// Cribbed from the cargo source.
+fn short_name(id: &SourceId) -> String {
+    let hash = hex::short_hash(id);
+    let ident = id.url().host_str().unwrap_or("").to_string();
+    format!("{}-{}", ident, hash)
 }
 
 fn work() -> Result<(), Error> {
     let config = Config::default().sync()?;
     let sid = SourceId::crates_io(&config).sync()?;
-    let mut source = sid.load(&config).sync()?;
-    let crates = get_crate_list(&config, &mut source)?;
-
-    /*
-    let res: Vec<_> = filter_dependencies(&mut source,
-                                          crates,
-                                          |dep| dep.name() == "cc" || dep.name() == "gcc")
-        .collect();
-*/
+    let source_name = short_name(&sid);
+    let regpath = config.registry_index_path().into_path_unlocked().join(&source_name);
+    println!("regpath: {:?}", regpath);
+    // Get a vec of all crate versions, and insert them all into the dag.
+    let mut dag: Dag<(), ()> = Dag::new();
+    let crates: Vec<_> = find_crates(&regpath)?;
+    // Lookup by name.
+    let mut by_name = HashMap::new();
+    let mut crate_nodes = HashMap::new();
+    for c in crates.iter() {
+        by_name.insert(&c.name, c);
+        for v in c.versions.iter() {
+            crate_nodes.insert(v, dag.add_node(()));
+        }
+    }
+    let get_dep = |dep: &Dependency| -> Option<&CrateVersion> {
+        by_name.get(&dep.name).and_then(|c| {
+            c.versions.iter().filter(|v| dep.req.matches(&v.version)).next()
+        })
+    };
+    let start = Instant::now();
+    for c in crates.iter() {
+        for v in c.versions.iter() {
+            let idx = *crate_nodes.get(v).unwrap();
+            for dep in v.deps.iter() {
+                // Just skip dev deps.
+                if let Some("dev") = dep.kind.as_ref().map(String::as_ref) {
+                    continue;
+                }
+                let depver = match get_dep(dep) {
+                    Some(s) => s,
+                    None => {
+                        println!("Failed to find dependency of {}: {}",
+                                v, dep);
+                        continue;
+                    }
+                };
+                let dep_idx = *crate_nodes.get(depver).unwrap();
+                //println!("{} -> {}", v, depver);
+                dag.add_edge(idx, dep_idx, ()).with_context(|e| {
+                    format!("Failed to add edge from {} to {} ({}): {}",
+                            v, dep, depver, e)
+                })?;
+            }
+        }
+    }
+    println!("Built dag with {} nodes, {} edges in {}",
+             dag.node_count(), dag.edge_count(),
+             fmt_duration_as_secs(&start.elapsed()));
     Ok(())
 }
 
 fn main() {
-    work().unwrap();
+    match work() {
+        Ok(_) => {}
+        Err(e) => println!("Error: {}, {}", e.cause(), e.backtrace()),
+    }
 }
